@@ -1221,7 +1221,7 @@ class RNodeInterface(Interface):
                                     escape = False
                                 command_buffer = command_buffer+bytes([byte])
                                 if (len(command_buffer) == 4):
-                                    self.r_stat_rx = ord(command_buffer[0]) << 24 | ord(command_buffer[1]) << 16 | ord(command_buffer[2]) << 8 | ord(command_buffer[3])
+                                    self.r_stat_rx = command_buffer[0] << 24 | command_buffer[1] << 16 | command_buffer[2] << 8 | command_buffer[3]
 
                         elif (command == KISS.CMD_STAT_TX):
                             if (byte == KISS.FESC):
@@ -1235,7 +1235,7 @@ class RNodeInterface(Interface):
                                     escape = False
                                 command_buffer = command_buffer+bytes([byte])
                                 if (len(command_buffer) == 4):
-                                    self.r_stat_tx = ord(command_buffer[0]) << 24 | ord(command_buffer[1]) << 16 | ord(command_buffer[2]) << 8 | ord(command_buffer[3])
+                                    self.r_stat_tx = command_buffer[0] << 24 | command_buffer[1] << 16 | command_buffer[2] << 8 | command_buffer[3]
 
                         elif (command == KISS.CMD_STAT_RSSI):
                             self.r_stat_rssi = byte-RNodeInterface.RSSI_OFFSET

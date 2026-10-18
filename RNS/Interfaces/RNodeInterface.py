@@ -54,9 +54,11 @@ class KISS():
     CMD_RADIO_LOCK  = 0x07
     CMD_ST_ALOCK    = 0x0B
     CMD_LT_ALOCK    = 0x0C
+    CMD_MODEM       = 0x0D
     CMD_DETECT      = 0x08
     CMD_LEAVE       = 0x0A
     CMD_READY       = 0x0F
+    CMD_MODEM_PARAM = 0x10
     CMD_STAT_RX     = 0x21
     CMD_STAT_TX     = 0x22
     CMD_STAT_RSSI   = 0x23
@@ -85,6 +87,25 @@ class KISS():
     RADIO_STATE_OFF = 0x00
     RADIO_STATE_ON  = 0x01
     RADIO_STATE_ASK = 0xFF
+
+    # Radio modem / packet-type selection, sent as the payload of CMD_MODEM.
+    # MODEM_LORA is the default and matches the historical behaviour: for LoRa
+    # no modem frame is sent at all, so the byte stream is unchanged. The other
+    # values require firmware that implements CMD_MODEM (the (G)FSK/FSK second
+    # modem support); MODEM_QUERY asks the device which packet type is active.
+    MODEM_LORA      = 0x01
+    MODEM_GFSK      = 0x03
+    MODEM_FSK       = 0x04
+    MODEM_QUERY     = 0xFF
+
+    # Sub-parameter IDs carried by CMD_MODEM_PARAM. The (G)FSK/FSK air profile
+    # is four fields; there is deliberately no set-all frame, so each field is
+    # written with its own frame, and 0xFF queries the whole profile at once.
+    MODEM_PARAM_BITRATE   = 0x00
+    MODEM_PARAM_DEVIATION = 0x01
+    MODEM_PARAM_BANDWIDTH = 0x02
+    MODEM_PARAM_WHITENING = 0x03
+    MODEM_PARAM_QUERY_ALL = 0xFF
     
     CMD_ERROR           = 0x90
     ERROR_INITRADIO     = 0x01
@@ -93,6 +114,9 @@ class KISS():
     ERROR_QUEUE_FULL    = 0x04
     ERROR_MEMORY_LOW    = 0x05
     ERROR_MODEM_TIMEOUT = 0x06
+    ERROR_BAD_MODEM     = 0x07
+    ERROR_RADIO_LOCKED  = 0x08
+    ERROR_BAD_PARAM     = 0x09
 
     PLATFORM_AVR   = 0x90
     PLATFORM_ESP32 = 0x80
@@ -131,6 +155,67 @@ class RNodeInterface(Interface):
     BATTERY_STATE_CHARGED     = 0x03
 
     DISPLAY_READ_INTERVAL     = 1.0
+    STATS_POLL_INTERVAL       = 5.0
+
+    # Modem name -> CMD_MODEM wire value. "lora" is the default when the
+    # `modem` key is absent from the configuration, which keeps every existing
+    # (LoRa) configuration byte-for-byte unchanged.
+    MODEMS = {
+        "lora": KISS.MODEM_LORA,
+        "gfsk": KISS.MODEM_GFSK,
+        "fsk":  KISS.MODEM_FSK,
+    }
+
+    # Defaults for the (G)FSK/FSK air profile. When `modem` is gfsk or fsk and
+    # the corresponding key is absent from the configuration, the host resolves
+    # to these values, which reproduce the firmware's pinned profile exactly
+    # (150 k / 300 k bps, 75 kHz deviation, 467 kHz RX bandwidth, whitening
+    # off) so the on-air result is byte-identical to a host that sends nothing.
+    #
+    # MODEM_DEFAULT_BANDWIDTH is the (G)FSK *RX bandwidth in Hz*. It is 467000,
+    # which is a valid entry of the shared (G)FSK RX bandwidth table below and
+    # the value the pinned profile uses. NOTE: this constant used to be 250000,
+    # a LoRa-shaped value that only existed to satisfy the old radio-lock
+    # predicate and is *not* a valid (G)FSK RX bandwidth; sending it would be
+    # rejected by the device (ERROR_BAD_PARAM). 467000 is the correct default.
+    MODEM_DEFAULT_BANDWIDTH = 467000
+    MODEM_DEFAULT_DEVIATION = 75000
+    MODEM_DEFAULT_WHITENING = False
+    MODEM_DEFAULT_BITRATES  = {
+        "gfsk": 150000,
+        "fsk":  300000,
+    }
+
+    # The shared (G)FSK RX bandwidth table, in Hz (21 entries, 4.8 kHz..467 kHz
+    # DSB). The firmware maps a requested Hz value to the chip code via exactly
+    # this table and rejects anything that is not an exact entry with
+    # ERROR_BAD_PARAM, so the host validates against the same set. Provenance:
+    # UM_LR1121_v1_2.txt:2814-2826 (Table 8-14), identical to lr1121.h:199-219
+    # and sx126x.h:65-85 in the firmware.
+    GFSK_RX_BANDWIDTHS = (
+        4800, 5800, 7300, 9700, 11700, 14600, 19500, 23400, 29300, 39000,
+        46900, 58600, 78200, 93800, 117300, 156200, 187200, 234300, 312000,
+        373600, 467000,
+    )
+
+    # Hard limits of the (G)FSK/FSK air profile, the intersection of the LR1121
+    # and SX1262 (both ends enforce these; see the profile plan §3.1).
+    GFSK_BITRATE_MIN = 600
+    GFSK_BITRATE_MAX = 300000
+    GFSK_DEVIATION_MIN = 600
+    GFSK_DEVIATION_MAX = 200000
+
+    # How long to wait for the device's whole-profile echo before giving up.
+    # Only used for the (G)FSK/FSK readback; a device that predates
+    # CMD_MODEM_PARAM simply does not answer, and the interface continues.
+    MODEM_PARAM_TIMEOUT = 0.5
+
+    # Inert defaults for the LoRa-only parameters when a non-LoRa modem is
+    # selected and the user has not supplied them. They are still transmitted
+    # for compatibility with firmware that has not yet relaxed its radio-lock
+    # predicate, which is LoRa-shaped.
+    MODEM_DEFAULT_SF        = 7
+    MODEM_DEFAULT_CR        = 5
 
     def __init__(self, owner, configuration):
         if RNS.vendor.platformutils.is_android():
@@ -153,7 +238,34 @@ class RNodeInterface(Interface):
         txpower      = int(c["txpower"]) if "txpower" in c else 0
         sf           = int(c["spreadingfactor"]) if "spreadingfactor" in c else 0
         cr           = int(c["codingrate"]) if "codingrate" in c else 0
+        modem        = str(c["modem"]).strip().lower() if "modem" in c else "lora"
         flow_control = c.as_bool("flow_control") if "flow_control" in c else False
+        # Polling the RX/TX counters is opt-in: the stock class never polls, so
+        # doing it by default would add traffic to every existing RNode link.
+        poll_stats   = c.as_bool("poll_stats") if "poll_stats" in c else False
+
+        # (G)FSK/FSK-only air profile. `bandwidth` is reused: it is the LoRa
+        # bandwidth when modem = lora, and the (G)FSK/FSK RX bandwidth in Hz
+        # otherwise. The three new keys are only meaningful for the non-LoRa
+        # modems and are ignored (left None/False) in LoRa.
+        modem_bitrate   = None
+        modem_deviation = None
+        whitening       = False
+
+        if modem != "lora":
+            # (G)FSK/FSK: the LoRa parameters have no effect on the air profile,
+            # but initRadio() still transmits them for compatibility with
+            # firmware whose radio-lock predicate is LoRa-shaped. Supply inert
+            # defaults when the user gave none. The (G)FSK/FSK profile itself is
+            # resolved to the pinned values when a key is absent, so the on-air
+            # result is identical to a host that sends no profile at all.
+            if bandwidth == 0: bandwidth = RNodeInterface.MODEM_DEFAULT_BANDWIDTH
+            if sf == 0:        sf        = RNodeInterface.MODEM_DEFAULT_SF
+            if cr == 0:        cr        = RNodeInterface.MODEM_DEFAULT_CR
+
+            modem_bitrate   = int(c["bitrate"]) if "bitrate" in c else RNodeInterface.MODEM_DEFAULT_BITRATES.get(modem)
+            modem_deviation = int(c["deviation"]) if "deviation" in c else RNodeInterface.MODEM_DEFAULT_DEVIATION
+            whitening       = c.as_bool("whitening") if "whitening" in c else RNodeInterface.MODEM_DEFAULT_WHITENING
         id_interval  = int(c["id_interval"]) if "id_interval" in c else None
         id_callsign  = c["id_callsign"] if "id_callsign" in c else None
         st_alock     = float(c["airtime_limit_short"]) if "airtime_limit_short" in c else None
@@ -206,6 +318,8 @@ class RNodeInterface(Interface):
         self.online      = False
         self.detached    = False
         self.reconnecting= False
+        self.radio_locked= False
+        self.modem_error = False
         self.hw_errors   = []
 
         self.use_tcp     = False
@@ -230,8 +344,14 @@ class RNodeInterface(Interface):
         self.txpower     = txpower
         self.sf          = sf
         self.cr          = cr
+        self.modem_name  = modem
+        self.modem       = RNodeInterface.MODEMS.get(modem, None)
         self.state       = KISS.RADIO_STATE_OFF
         self.bitrate     = 0
+        # Resolved (G)FSK/FSK air profile. None/False in LoRa.
+        self.modem_bitrate   = modem_bitrate
+        self.modem_deviation = modem_deviation
+        self.whitening       = whitening
         self.st_alock    = st_alock
         self.lt_alock    = lt_alock
         self.cpu_temp    = None
@@ -254,6 +374,11 @@ class RNodeInterface(Interface):
         self.r_cr        = None
         self.r_state     = None
         self.r_lock      = None
+        self.r_modem     = None
+        self.r_modem_param = None
+        self.expecting_modem_param  = False
+        self.modem_param_unsupported= False
+        self.modem_param_mismatch   = False
         self.r_stat_rx   = None
         self.r_stat_tx   = None
         self.r_stat_rssi = None
@@ -294,6 +419,11 @@ class RNodeInterface(Interface):
         self.should_read_display   = False
         self.read_display_interval = RNodeInterface.DISPLAY_READ_INTERVAL
 
+        self.poll_stats         = poll_stats
+        self.stats_poll_interval= RNodeInterface.STATS_POLL_INTERVAL
+        self.should_poll_stats  = False
+        self.stats_poll_thread  = None
+
         self.packet_queue    = []
         self.flow_control    = flow_control
         self.shared_medium   = True
@@ -313,17 +443,33 @@ class RNodeInterface(Interface):
             RNS.log("Invalid TX power configured for "+str(self), RNS.LOG_ERROR)
             self.validcfg = False
 
-        if (self.bandwidth < 7800 or self.bandwidth > 1625000):
-            RNS.log("Invalid bandwidth configured for "+str(self), RNS.LOG_ERROR)
+        if self.modem == None:
+            RNS.log("Invalid modem \""+str(self.modem_name)+"\" configured for "+str(self)+". Valid modems are: "+", ".join(sorted(RNodeInterface.MODEMS.keys())), RNS.LOG_ERROR)
             self.validcfg = False
 
-        if (self.sf < 5 or self.sf > 12):
-            RNS.log("Invalid spreading factor configured for "+str(self), RNS.LOG_ERROR)
-            self.validcfg = False
+        if self.modem == KISS.MODEM_LORA:
+            # The LoRa air parameters are only meaningful - and only validated -
+            # for the LoRa modem. In (G)FSK/FSK the profile is validated against
+            # the chip intersection below instead.
+            if (self.bandwidth < 7800 or self.bandwidth > 1625000):
+                RNS.log("Invalid bandwidth configured for "+str(self), RNS.LOG_ERROR)
+                self.validcfg = False
 
-        if (self.cr < 5 or self.cr > 8):
-            RNS.log("Invalid coding rate configured for "+str(self), RNS.LOG_ERROR)
-            self.validcfg = False
+            if (self.sf < 5 or self.sf > 12):
+                RNS.log("Invalid spreading factor configured for "+str(self), RNS.LOG_ERROR)
+                self.validcfg = False
+
+            if (self.cr < 5 or self.cr > 8):
+                RNS.log("Invalid coding rate configured for "+str(self), RNS.LOG_ERROR)
+                self.validcfg = False
+
+        elif self.modem == KISS.MODEM_GFSK or self.modem == KISS.MODEM_FSK:
+            # (G)FSK/FSK: validate the air profile against the intersection of
+            # the two supported chips (hard rules H1-H5), and warn about the
+            # robustness rules (A1/A2) without rejecting. The LoRa bandwidth/SF/
+            # CR rules above must NOT run here: the same `bandwidth` key now
+            # means the (G)FSK RX bandwidth in Hz.
+            self.validateModemProfile()
 
         if (self.st_alock and (self.st_alock < 0.0 or self.st_alock > 100.0)):
             RNS.log("Invalid short-term airtime limit configured for "+str(self), RNS.LOG_ERROR)
@@ -358,11 +504,90 @@ class RNodeInterface(Interface):
             RNS.log("Could not open serial port for interface "+str(self), RNS.LOG_ERROR)
             RNS.log("The contained exception was: "+str(e), RNS.LOG_ERROR)
             RNS.log("Reticulum will attempt to bring up this interface periodically", RNS.LOG_ERROR)
-            if not self.detached and not self.reconnecting:
+            if not self.detached and not self.reconnecting and not self.fatal_config_error:
                 thread = threading.Thread(target=self.reconnect_port)
                 thread.daemon = True
                 thread.start()
 
+
+    def validateModemProfile(self):
+        """Validate the resolved (G)FSK/FSK air profile (hard rules H1-H5).
+
+        Runs at config parse, only when `modem` is gfsk or fsk. The rules are
+        the intersection of the LR1121 and SX1262 (both ends enforce them; the
+        device is a backstop that answers ERROR_BAD_PARAM). A failure logs the
+        reason and sets validcfg = False, so the generic raise at the end of
+        __init__ fires. The robustness rules A1/A2 only warn.
+        """
+        br = self.modem_bitrate
+        fdev = self.modem_deviation
+        bw = self.bandwidth
+
+        # H1: 600 <= BR <= 300000 bps.
+        if br == None or br < RNodeInterface.GFSK_BITRATE_MIN or br > RNodeInterface.GFSK_BITRATE_MAX:
+            RNS.log("Invalid (G)FSK bitrate configured for "+str(self)+": "+str(br)+" bps (must be "+str(RNodeInterface.GFSK_BITRATE_MIN)+".."+str(RNodeInterface.GFSK_BITRATE_MAX)+")", RNS.LOG_ERROR)
+            self.validcfg = False
+
+        # H2: 600 <= Fdev <= 200000 Hz.
+        if fdev == None or fdev < RNodeInterface.GFSK_DEVIATION_MIN or fdev > RNodeInterface.GFSK_DEVIATION_MAX:
+            RNS.log("Invalid (G)FSK frequency deviation configured for "+str(self)+": "+str(fdev)+" Hz (must be "+str(RNodeInterface.GFSK_DEVIATION_MIN)+".."+str(RNodeInterface.GFSK_DEVIATION_MAX)+")", RNS.LOG_ERROR)
+            self.validcfg = False
+
+        # H3: the RX bandwidth must be exactly one of the shared table entries.
+        # There is deliberately no rounding: the table is sparse and the
+        # 2*Fdev + BR margin is tight, so a silently rounded value could flip a
+        # legal request into an illegal one. Note for the user: the `bandwidth`
+        # key means the LoRa bandwidth when modem = lora, and the (G)FSK RX
+        # bandwidth in Hz otherwise, so the LoRa default 250000 is not valid here.
+        if bw not in RNodeInterface.GFSK_RX_BANDWIDTHS:
+            RNS.log("Invalid (G)FSK RX bandwidth configured for "+str(self)+": "+str(bw)+" Hz is not one of the supported table entries. Note that `bandwidth` is the LoRa bandwidth when modem = lora, and the (G)FSK RX bandwidth in Hz otherwise", RNS.LOG_ERROR)
+            self.validcfg = False
+
+        # H4: 2*Fdev + BR < BWF (strict), and H5: h = 2*Fdev/BR >= 0.5.
+        # Guarded on a known-good table entry and positive values so the
+        # arithmetic below is always well defined.
+        if bw in RNodeInterface.GFSK_RX_BANDWIDTHS and br != None and fdev != None:
+            if (2*fdev + br) >= bw:
+                RNS.log("Invalid (G)FSK air profile for "+str(self)+": 2*deviation + bitrate ("+str(2*fdev+br)+" Hz) must be less than the RX bandwidth ("+str(bw)+" Hz)", RNS.LOG_ERROR)
+                self.validcfg = False
+
+            # H5 is the modulation index floor h >= 0.5, i.e. 2*Fdev/BR >= 0.5
+            # (equivalently 4*Fdev >= BR). This is stated for the LR1121 and
+            # applied here as the conservative common floor. NB: the profile
+            # plan's pseudocode writes this as `2*FD >= BR`; that is the
+            # h >= 1.0 (A1) threshold, not h >= 0.5, and using it literally
+            # would reject the pinned plain-FSK default (Fdev 75000, BR 300000,
+            # h = 0.5). The normative prose (h = 2*Fdev/BR >= 0.5) is followed.
+            if 4*fdev < br:
+                RNS.log("Invalid (G)FSK air profile for "+str(self)+": modulation index h = 2*deviation/bitrate = "+str(round((2.0*fdev)/br, 3))+" must be at least 0.5", RNS.LOG_ERROR)
+                self.validcfg = False
+
+        # A1 (advisory, GFSK only): h >= 1.0. Below this, with Gaussian shaping
+        # (BT 0.5), the eye closes (measured on air); plain FSK is fine at 0.5.
+        if self.modem == KISS.MODEM_GFSK and br != None and fdev != None and (2*fdev) < br:
+            RNS.log("The (G)FSK profile for "+str(self)+" has modulation index h = "+str(round((2.0*fdev)/br, 3))+" < 1.0; with Gaussian shaping (BT 0.5) the eye may close and the link may be unreliable", RNS.LOG_WARNING)
+
+        # A2 (advisory): leave margin for the frequency-error term, preferring
+        # 2*Fdev + BR <= 0.9*BWF. Deliberately suppressed for the pinned
+        # default profile: that profile is empirically proven on air (the
+        # acceptance suite runs it at 100% delivery), and a warning that fires
+        # on every default `modem = fsk` bring-up is one users learn to ignore
+        # -- which would defeat its purpose for a genuinely thin user profile.
+        pinned = (br == RNodeInterface.MODEM_DEFAULT_BITRATES.get(self.modem_name)
+                  and fdev == RNodeInterface.MODEM_DEFAULT_DEVIATION
+                  and bw == RNodeInterface.MODEM_DEFAULT_BANDWIDTH)
+        if (not pinned) and bw in RNodeInterface.GFSK_RX_BANDWIDTHS and br != None and fdev != None and (2*fdev + br) > 0.9*bw:
+            RNS.log("The (G)FSK profile for "+str(self)+" uses "+str(round(100.0*(2*fdev+br)/bw, 1))+"% of the RX bandwidth (2*deviation + bitrate = "+str(2*fdev+br)+" Hz of "+str(bw)+" Hz); leave margin for crystal drift", RNS.LOG_WARNING)
+
+
+    @property
+    def fatal_config_error(self):
+        # Conditions that reconnecting cannot resolve, and which would
+        # otherwise produce an endless, unexplained reconnect loop:
+        #  - the device has locked its radio (no frequency/TX power stored),
+        #  - the device rejected the selected modem (unsupported firmware or
+        #    radio family).
+        return self.radio_locked or self.modem_error
 
     def open_port(self):
         if not self.use_ble and not self.use_tcp:
@@ -468,6 +693,7 @@ class RNodeInterface(Interface):
                 RNS.log(str(self)+" is configured and powered up")
                 sleep(0.3)
                 self.online = True
+                self.start_stats_polling()
             else:
                 RNS.log("After configuring "+str(self)+", the reported radio parameters did not match your configuration.", RNS.LOG_ERROR)
                 RNS.log("Make sure that your hardware actually supports the parameters specified in the configuration", RNS.LOG_ERROR)
@@ -484,6 +710,14 @@ class RNodeInterface(Interface):
         self.setSTALock()
         self.setLTALock()
         self.setRadioState(KISS.RADIO_STATE_ON)
+        # Select the modem after the radio is up. The order matters: the device
+        # only re-enters RX on a modem switch when the radio is already online,
+        # and the radio only starts if the device's lock predicate is satisfied
+        # by the configuration sent above (see setModem and validateRadioState).
+        self.setModem()
+        # Send the resolved (G)FSK/FSK air profile after the modem switch, then
+        # read it back and compare. No-op (and no 0x10 frame) in LoRa.
+        self.setModemProfile()
 
         if self.use_ble: time.sleep(2)
 
@@ -551,6 +785,17 @@ class RNodeInterface(Interface):
         if written != len(kiss_command):
             raise IOError("An IO error occurred while sending display read command")
 
+    def request_stats(self):
+        # Ask the device for its RX and TX counters. The device answers with
+        # CMD_STAT_RX and CMD_STAT_TX, which readLoop() parses into r_stat_rx
+        # and r_stat_tx. Only ever sent when the user opted in with `poll_stats`,
+        # so the default byte stream stays exactly as it was.
+        for command in (KISS.CMD_STAT_RX, KISS.CMD_STAT_TX):
+            kiss_command = bytes([KISS.FEND, command, KISS.FEND])
+            written = self.serial.write(kiss_command)
+            if written != len(kiss_command):
+                raise IOError("An IO error occurred while requesting statistics for "+str(self))
+
     def _read_display_job(self):
         while self.should_read_display:
             self.read_display()
@@ -563,6 +808,30 @@ class RNodeInterface(Interface):
 
     def stop_display_updates(self):
         self.should_read_display = False
+
+    def _poll_stats_job(self):
+        while self.should_poll_stats:
+            try:
+                self.request_stats()
+            except Exception as e:
+                # readLoop() owns port failure and reconnection. This thread
+                # only stops, so a dead port cannot take the interface down.
+                RNS.log(f"Could not poll statistics for {self}: {e}", RNS.LOG_DEBUG)
+                break
+            time.sleep(self.stats_poll_interval)
+
+    def start_stats_polling(self):
+        # Never started unless polling was opted into, and never more than one
+        # thread at a time, so a reconnect cannot stack up pollers.
+        if not self.poll_stats:
+            return
+        if self.stats_poll_thread == None or not self.stats_poll_thread.is_alive():
+            self.should_poll_stats = True
+            self.stats_poll_thread = threading.Thread(target=self._poll_stats_job, daemon=True)
+            self.stats_poll_thread.start()
+
+    def stop_stats_polling(self):
+        self.should_poll_stats = False
 
     def hard_reset(self):
         kiss_command = bytes([KISS.FEND, KISS.CMD_RESET, 0xf8, KISS.FEND])
@@ -647,6 +916,84 @@ class RNodeInterface(Interface):
         if written != len(kiss_command):
             raise IOError("An IO error occurred while configuring radio state for "+str(self))
 
+    def setModem(self):
+        # No-op for LoRa, so the historical byte stream is preserved exactly and
+        # the device keeps whatever packet type it has persisted. For the other
+        # modems, the switch re-initialises the packet type on the device and
+        # re-enters RX (when the radio is already online).
+        if self.modem == KISS.MODEM_LORA or self.modem == None:
+            return
+
+        # Forget any modem the device reported earlier (e.g. before a
+        # reconnect) so that the acknowledgement of *this* switch is what sets
+        # r_modem. That makes it possible to tell an ERROR_BAD_MODEM for the
+        # modem switch apart from one for a CMD_MODEM_PARAM capability probe.
+        self.r_modem = None
+
+        kiss_command = bytes([KISS.FEND])+bytes([KISS.CMD_MODEM])+bytes([self.modem])+bytes([KISS.FEND])
+        written = self.serial.write(kiss_command)
+        if written != len(kiss_command):
+            raise IOError("An IO error occurred while configuring modem for "+str(self))
+
+    def setModemParam(self, param_id, value):
+        # One CMD_MODEM_PARAM frame per field: there is no set-all frame. Values
+        # are big-endian, matching every other multi-byte command, and are
+        # escaped because an arbitrary 32-bit value can contain FEND/FESC.
+        data = KISS.escape(bytes([param_id])+bytes(value))
+        kiss_command = bytes([KISS.FEND, KISS.CMD_MODEM_PARAM])+data+bytes([KISS.FEND])
+        written = self.serial.write(kiss_command)
+        if written != len(kiss_command):
+            raise IOError("An IO error occurred while configuring the modem profile for "+str(self))
+
+    def queryModemProfile(self):
+        kiss_command = bytes([KISS.FEND, KISS.CMD_MODEM_PARAM, KISS.MODEM_PARAM_QUERY_ALL, KISS.FEND])
+        written = self.serial.write(kiss_command)
+        if written != len(kiss_command):
+            raise IOError("An IO error occurred while querying the modem profile for "+str(self))
+
+    def setModemProfile(self):
+        # No-op in LoRa: no CMD_MODEM_PARAM frame is ever written, so the LoRa
+        # byte stream is unchanged.
+        if self.modem == KISS.MODEM_LORA or self.modem == None:
+            return
+
+        self.setModemParam(KISS.MODEM_PARAM_BITRATE,   self.modem_bitrate.to_bytes(4, byteorder="big", signed=False))
+        self.setModemParam(KISS.MODEM_PARAM_DEVIATION, self.modem_deviation.to_bytes(4, byteorder="big", signed=False))
+        self.setModemParam(KISS.MODEM_PARAM_BANDWIDTH, self.bandwidth.to_bytes(4, byteorder="big", signed=False))
+        self.setModemParam(KISS.MODEM_PARAM_WHITENING, bytes([1 if self.whitening else 0]))
+        self.verifyModemProfile()
+
+    def verifyModemProfile(self):
+        # §1.6: neither chip has a modulation-parameter readback, so the echo is
+        # the firmware's applied shadow. The host MUST query the whole profile
+        # and compare request against echo, treating any difference as failure.
+        self.r_modem_param = None
+        self.modem_param_mismatch = False
+        self.modem_param_unsupported = False
+        self.expecting_modem_param = True
+        try:
+            self.queryModemProfile()
+            deadline = time.time() + self.MODEM_PARAM_TIMEOUT
+            while self.r_modem_param == None and not self.modem_param_unsupported and time.time() < deadline:
+                sleep(0.05)
+        finally:
+            self.expecting_modem_param = False
+
+        if self.r_modem_param == None:
+            # No answer. A device that predates CMD_MODEM_PARAM drops the
+            # unknown frame (or answers ERROR_BAD_MODEM, handled in readLoop);
+            # either way the interface continues and the device keeps the
+            # profile it already has. This is the documented compatibility path.
+            RNS.log(str(self)+" did not return a modem profile readback; assuming the device predates CMD_MODEM_PARAM", RNS.LOG_DEBUG)
+            return
+
+        requested = (self.modem_bitrate, self.modem_deviation, self.bandwidth, 1 if self.whitening else 0)
+        if tuple(self.r_modem_param) != requested:
+            RNS.log(str(self)+" modem profile readback mismatch: requested "+str(requested)+", device reports "+str(tuple(self.r_modem_param)), RNS.LOG_ERROR)
+            self.modem_param_mismatch = True
+        else:
+            RNS.log(str(self)+" modem profile confirmed by device readback: bitrate "+str(requested[0])+" bps, deviation "+str(requested[1])+" Hz, RX bandwidth "+str(requested[2])+" Hz, whitening "+("on" if requested[3] else "off"), RNS.LOG_VERBOSE)
+
     def validate_firmware(self):
         if (self.maj_version > RNodeInterface.REQUIRED_FW_VER_MAJ):
             self.firmware_ok = True
@@ -674,6 +1021,39 @@ class RNodeInterface(Interface):
             RNS.log(f"Device disappeared during radio state validation for {self}", RNS.LOG_ERROR)
             return False
 
+        if self.modem != KISS.MODEM_LORA:
+            # (G)FSK/FSK: bandwidth, spreading factor and coding rate do not
+            # describe the air profile (it is pinned in firmware), so only the
+            # parameters that do apply are validated here. The radio state is
+            # polled rather than compared once, because switching the modem
+            # re-initialises the radio on the device and its state report can
+            # lag the RADIO_STATE_ON command.
+            wait_until = time.time() + 3.0
+            while self.r_state != self.state and time.time() < wait_until:
+                sleep(0.2)
+
+            self.validcfg = True
+            if (self.r_frequency != None and abs(self.frequency - int(self.r_frequency)) > 100):
+                RNS.log("Frequency mismatch", RNS.LOG_ERROR)
+                self.validcfg = False
+            if (self.txpower != self.r_txpower):
+                RNS.log("TX power mismatch", RNS.LOG_ERROR)
+                self.validcfg = False
+            if (self.r_modem != None and self.r_modem != self.modem):
+                RNS.log("Modem mismatch: device reports "+RNS.hexrep(self.r_modem)+", expected "+RNS.hexrep(self.modem), RNS.LOG_ERROR)
+                self.validcfg = False
+            if (self.state != self.r_state):
+                RNS.log("Radio state mismatch", RNS.LOG_ERROR)
+                self.validcfg = False
+            if self.modem_param_mismatch:
+                # The whole-profile readback disagreed with the request, or the
+                # device rejected a parameter. The air profile is not what was
+                # asked for, so the interface must not come up claiming it is.
+                RNS.log("Modem profile mismatch", RNS.LOG_ERROR)
+                self.validcfg = False
+
+            return self.validcfg
+
         self.validcfg = True
         if (self.r_frequency != None and abs(self.frequency - int(self.r_frequency)) > 100):
             RNS.log("Frequency mismatch", RNS.LOG_ERROR)
@@ -696,6 +1076,17 @@ class RNodeInterface(Interface):
 
 
     def updateBitrate(self):
+        if self.modem == KISS.MODEM_GFSK or self.modem == KISS.MODEM_FSK:
+            # (G)FSK/FSK: the on-air bitrate is the configured (resolved) profile
+            # bitrate, not something derivable from the LoRa parameters. If the
+            # profile is unknown for any reason, fall back to the pinned default.
+            self.bitrate = self.modem_bitrate
+            if self.bitrate == None:
+                self.bitrate = RNodeInterface.MODEM_DEFAULT_BITRATES.get(self.modem_name, 0)
+            self.bitrate_kbps = round(self.bitrate/1000.0, 2)
+            RNS.log(str(self)+" On-air bitrate is now "+str(self.bitrate_kbps)+ " kbps", RNS.LOG_VERBOSE)
+            return
+
         try:
             self.bitrate = self.r_sf * ( (4.0/self.r_cr) / (math.pow(2,self.r_sf)/(self.r_bandwidth/1000)) ) * 1000
             self.bitrate_kbps = round(self.bitrate/1000.0, 2)
@@ -831,6 +1222,29 @@ class RNodeInterface(Interface):
                             else:
                                 RNS.log(str(self)+" Radio reporting state is offline", RNS.LOG_DEBUG)
 
+                        elif (command == KISS.CMD_MODEM):
+                            self.r_modem = byte
+
+                        elif (command == KISS.CMD_MODEM_PARAM):
+                            if (byte == KISS.FESC):
+                                escape = True
+                            else:
+                                if (escape):
+                                    if (byte == KISS.TFEND):
+                                        byte = KISS.FEND
+                                    if (byte == KISS.TFESC):
+                                        byte = KISS.FESC
+                                    escape = False
+                                command_buffer = command_buffer+bytes([byte])
+                                # Whole-profile reply: <0xFF> <br4> <fdev4> <bw4> <wh1>
+                                if (len(command_buffer) == 14 and command_buffer[0] == KISS.MODEM_PARAM_QUERY_ALL):
+                                    br = command_buffer[1] << 24 | command_buffer[2] << 16 | command_buffer[3] << 8 | command_buffer[4]
+                                    fd = command_buffer[5] << 24 | command_buffer[6] << 16 | command_buffer[7] << 8 | command_buffer[8]
+                                    bw = command_buffer[9] << 24 | command_buffer[10] << 16 | command_buffer[11] << 8 | command_buffer[12]
+                                    wh = command_buffer[13]
+                                    self.r_modem_param = (br, fd, bw, wh)
+                                    RNS.log(str(self)+" Radio reporting modem profile: "+str(br)+" bps, "+str(fd)+" Hz deviation, "+str(bw)+" Hz RX bandwidth, whitening "+("on" if wh else "off"), RNS.LOG_DEBUG)
+
                         elif (command == KISS.CMD_RADIO_LOCK):
                             self.r_lock = byte
                         elif (command == KISS.CMD_FW_VERSION):
@@ -861,7 +1275,8 @@ class RNodeInterface(Interface):
                                     escape = False
                                 command_buffer = command_buffer+bytes([byte])
                                 if (len(command_buffer) == 4):
-                                    self.r_stat_rx = ord(command_buffer[0]) << 24 | ord(command_buffer[1]) << 16 | ord(command_buffer[2]) << 8 | ord(command_buffer[3])
+                                    self.r_stat_rx = command_buffer[0] << 24 | command_buffer[1] << 16 | command_buffer[2] << 8 | command_buffer[3]
+                                    RNS.log(str(self)+" Radio reporting RX counter is "+str(self.r_stat_rx), RNS.LOG_DEBUG)
 
                         elif (command == KISS.CMD_STAT_TX):
                             if (byte == KISS.FESC):
@@ -875,7 +1290,8 @@ class RNodeInterface(Interface):
                                     escape = False
                                 command_buffer = command_buffer+bytes([byte])
                                 if (len(command_buffer) == 4):
-                                    self.r_stat_tx = ord(command_buffer[0]) << 24 | ord(command_buffer[1]) << 16 | ord(command_buffer[2]) << 8 | ord(command_buffer[3])
+                                    self.r_stat_tx = command_buffer[0] << 24 | command_buffer[1] << 16 | command_buffer[2] << 8 | command_buffer[3]
+                                    RNS.log(str(self)+" Radio reporting TX counter is "+str(self.r_stat_tx), RNS.LOG_DEBUG)
 
                         elif (command == KISS.CMD_STAT_RSSI):
                             self.r_stat_rssi = byte-RNodeInterface.RSSI_OFFSET
@@ -1004,8 +1420,15 @@ class RNodeInterface(Interface):
                                         self.r_premable_time_ms  = prt
                                         self.r_csma_slot_time_ms = cst
                                         self.r_csma_difs_ms      = dft
-                                        RNS.log(f"{self} Radio reporting symbol time is "+str(round(self.r_symbol_time_ms,2))+"ms ("+str(self.r_symbol_rate)+" baud)", RNS.LOG_DEBUG)
-                                        RNS.log(f"{self} Radio reporting preamble is "+str(self.r_preamble_symbols)+" symbols ("+str(self.r_premable_time_ms)+"ms)", RNS.LOG_DEBUG)
+                                        # Outside LoRa the symbol-rate field carries
+                                        # kbaud, and the preamble is counted in bits:
+                                        # a (G)FSK/FSK symbol rate does not fit the
+                                        # 16-bit field in baud, and its preamble is a
+                                        # bit count. See kiss_indicate_phy_stats().
+                                        rate_unit = "baud" if self.modem == KISS.MODEM_LORA else "kbaud"
+                                        pre_unit  = "symbols" if self.modem == KISS.MODEM_LORA else "bits"
+                                        RNS.log(f"{self} Radio reporting symbol time is "+str(round(self.r_symbol_time_ms,2))+"ms ("+str(self.r_symbol_rate)+" "+rate_unit+")", RNS.LOG_DEBUG)
+                                        RNS.log(f"{self} Radio reporting preamble is "+str(self.r_preamble_symbols)+" "+pre_unit+" ("+str(self.r_premable_time_ms)+"ms)", RNS.LOG_DEBUG)
                                         RNS.log(f"{self} Radio reporting CSMA slot time is "+str(self.r_csma_slot_time_ms)+"ms", RNS.LOG_DEBUG)
                                         RNS.log(f"{self} Radio reporting DIFS time is "+str(self.r_csma_difs_ms)+"ms", RNS.LOG_DEBUG)
                         elif (command == KISS.CMD_STAT_CSMA):
@@ -1086,6 +1509,45 @@ class RNodeInterface(Interface):
                             elif (byte == KISS.ERROR_MODEM_TIMEOUT):
                                 RNS.log(str(self)+" hardware error (code "+RNS.hexrep(byte)+"): Modem communication timed out", RNS.LOG_ERROR)
                                 self.hw_errors.append({"error": KISS.ERROR_MODEM_TIMEOUT, "description": "Modem communication timed out on connected device"})
+                            elif (byte == KISS.ERROR_BAD_MODEM):
+                                if self.expecting_modem_param and self.r_modem == self.modem:
+                                    # The modem switch was acknowledged, so this
+                                    # error answers a CMD_MODEM_PARAM frame: the
+                                    # device predates the command (it drops the
+                                    # unknown frame or answers ERROR_BAD_MODEM).
+                                    # This is the compatibility path, not a
+                                    # configuration error; log it and continue.
+                                    RNS.log(str(self)+" the connected RNode does not implement CMD_MODEM_PARAM (code "+RNS.hexrep(byte)+"); the device will keep its stored or default (G)FSK/FSK profile", RNS.LOG_NOTICE)
+                                    self.modem_param_unsupported = True
+                                else:
+                                    # The device rejected the requested modem:
+                                    # either its firmware has no CMD_MODEM support,
+                                    # or the radio family does not implement that
+                                    # modem. Reconnecting cannot change either, so
+                                    # this is treated as a configuration error.
+                                    RNS.log(str(self)+" the connected RNode does not support modem \""+str(self.modem_name)+"\" (code "+RNS.hexrep(byte)+")", RNS.LOG_ERROR)
+                                    RNS.log("Check that the device runs RNode firmware with CMD_MODEM support, and that its radio family implements the selected modem (plain 2-FSK is only available on the LR1121 and SX1262)", RNS.LOG_ERROR)
+                                    self.hw_errors.append({"error": KISS.ERROR_BAD_MODEM, "description": "Unsupported modem \""+str(self.modem_name)+"\" on connected device"})
+                                    self.modem_error = True
+                            elif (byte == KISS.ERROR_BAD_PARAM):
+                                # The device rejected a profile value that the
+                                # host believed was legal (the device is the
+                                # backstop for a buggy host or a radio family
+                                # with a different intersection). Never silently
+                                # accept it: mark the profile as failed.
+                                RNS.log(str(self)+" the connected RNode rejected a modem profile parameter as invalid (code "+RNS.hexrep(byte)+")", RNS.LOG_ERROR)
+                                RNS.log("Check the (G)FSK/FSK bitrate, deviation and RX bandwidth against the device's supported values", RNS.LOG_ERROR)
+                                self.hw_errors.append({"error": KISS.ERROR_BAD_PARAM, "description": "Device rejected a modem profile parameter"})
+                                self.modem_param_mismatch = True
+                            elif (byte == KISS.ERROR_RADIO_LOCKED):
+                                # The device refuses to start its radio because
+                                # its stored configuration has no frequency
+                                # and/or TX power. A reconnect re-sends the same
+                                # configuration, so it would loop forever.
+                                RNS.log(str(self)+" the connected RNode is locked and will not start its radio: no frequency and/or TX power is configured on the device", RNS.LOG_ERROR)
+                                RNS.log("Set `frequency` and `txpower` in the interface configuration, or provision the device with rnodeconf", RNS.LOG_ERROR)
+                                self.hw_errors.append({"error": KISS.ERROR_RADIO_LOCKED, "description": "Radio locked on connected device: no frequency and/or TX power configured"})
+                                self.radio_locked = True
                             else:
                                 RNS.log(str(self)+" hardware error (code "+RNS.hexrep(byte)+")", RNS.LOG_ERROR)
                                 raise IOError("Unknown hardware failure")
@@ -1166,15 +1628,16 @@ class RNodeInterface(Interface):
                 RNS.log("Reticulum will attempt to reconnect the interface periodically.", RNS.LOG_ERROR)
 
         self.online = False
+        self.stop_stats_polling()
         try: self.serial.close()
         except Exception as e: pass
 
-        if not self.detached and not self.reconnecting:
+        if not self.detached and not self.reconnecting and not self.fatal_config_error:
             self.reconnect_port()
 
     def reconnect_port(self):
         self.reconnecting = True
-        while not self.online and not self.detached:
+        while not self.online and not self.detached and not self.fatal_config_error:
             try:
                 time.sleep(5)
                 RNS.log("Attempting to reconnect serial port "+str(self.port)+" for "+str(self)+"...", RNS.LOG_VERBOSE)
@@ -1189,6 +1652,7 @@ class RNodeInterface(Interface):
 
     def detach(self):
         self.detached = True
+        self.stop_stats_polling()
         try:
             self.disable_external_framebuffer()
             self.setRadioState(KISS.RADIO_STATE_OFF)
@@ -1252,7 +1716,13 @@ class RNodeInterface(Interface):
             return data
 
     def __str__(self):
-        return f"RNodeInterface[{self.name}]"
+        # The LoRa form is kept exactly as before, because existing tooling and
+        # log parsers key off "RNodeInterface[name]".
+        modem = getattr(self, "modem", None)
+        if modem == None or modem == KISS.MODEM_LORA:
+            return f"RNodeInterface[{self.name}]"
+        modem_name = str(getattr(self, "modem_name", "unknown")).upper()
+        return f"RNodeInterface[{self.name}/{modem_name}]"
 
 class BLEConnection():
     UART_SERVICE_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
